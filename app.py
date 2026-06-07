@@ -393,17 +393,25 @@ with tab_chart:
         )
 
         # Candlestick
-        fig.add_trace(go.Candlestick(
-            x=candles_df.get("datetime", candles_df.index),
-            open=candles_df["open"], high=candles_df["high"],
-            low=candles_df["low"],   close=candles_df["close"],
-            name="Price",
-            increasing_line_color="#00e5a0",
-            decreasing_line_color="#ff5555",
-            increasing_fillcolor="#00e5a033",
-            decreasing_fillcolor="#ff555533",
-        ), row=1, col=1)
-
+        # Candlestick Chart
+fig.add_trace(
+    go.Candlestick(
+        x=candles_df["datetime"] if "datetime" in candles_df.columns else candles_df.index,
+        open=candles_df["open"],
+        high=candles_df["high"],
+        low=candles_df["low"],
+        close=candles_df["close"],
+        name="Price",
+        increasing=dict(
+            line=dict(color="#00e5a0")
+        ),
+        decreasing=dict(
+            line=dict(color="#ff5555")
+        )
+    ),
+    row=1,
+    col=1
+  )
         # EMAs
         if "ema_50" in candles_df.columns:
             fig.add_trace(go.Scatter(
