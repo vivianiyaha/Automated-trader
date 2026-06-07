@@ -413,8 +413,8 @@ with tab_chart:
       col=1
     )
         # EMAs
-        if "ema_50" in candles_df.columns:
-            fig.add_trace(go.Scatter(
+    if "ema_50" in candles_df.columns:
+      fig.add_trace(go.Scatter(
                 x=candles_df.get("datetime", candles_df.index),
                 y=candles_df["ema_50"], name="EMA 50",
                 line=dict(color="#00bfff", width=1.5, dash="dot"),
