@@ -1,309 +1,268 @@
 """
-trade_executor.py — Orchestrates the full trading loop:
-  connect → scan → signal → execute → monitor → close.
+trade_executor.py - Orchestrates signal analysis, trade entry, and position management.
+Runs as a background async loop that can be started / stopped from the Streamlit UI.
 """
 
+import asyncio
 import time
-import threading
 from datetime import datetime
-from typing import Optional
+from typing import Dict, List, Optional
 
-from deriv_api import DerivAPI, MockDerivAPI
-from strategy  import analyse_market
-from risk_manager import RiskManager
-from database import (save_signal, save_trade, close_trade,
-                      get_open_trades, save_account_snapshot)
-from utils import display_name, now_utc, round_price
-from config import SCAN_INTERVAL, HIGHER_TF, EXEC_TF, TIMEFRAMES
-import logger
+from config import (HIGHER_TIMEFRAMES, EXECUTION_TIMEFRAMES,
+                     ALL_PAIRS, PAIR_DISPLAY)
+from deriv_api import DerivAPI
+from strategy import StrategyEngine, TradeSignal
+from risk_manager import RiskManager, RiskSettings
+from database import (init_db, insert_signal, insert_trade, close_trade,
+                       get_open_trades, insert_account_snapshot,
+                       upsert_daily_summary)
+from logger import (log_event, log_signal, log_trade_open,
+                     log_trade_close, log_error)
 
 
 class TradeExecutor:
     """
-    Main bot controller.  Designed to run its loop in a background thread
-    so that Streamlit can keep rendering while the bot operates.
-
-    State is stored in:
-      - SQLite (via database.py)
-      - In-memory signal/trade lists for fast Streamlit display
+    Main trading loop.
+    Call start() to begin; stop() to halt gracefully.
     """
 
-    def __init__(self, api_token: str, demo_mode: bool,
-                 risk_manager: RiskManager,
-                 selected_pairs: list[str],
-                 exec_timeframe: str = "M15"):
+    SCAN_INTERVAL = 60   # seconds between full market scans
 
-        self.api_token      = api_token
-        self.demo_mode      = demo_mode
-        self.rm             = risk_manager
-        self.pairs          = selected_pairs
-        self.exec_tf        = exec_timeframe
+    def __init__(self, api: DerivAPI, risk_mgr: RiskManager,
+                 selected_pairs: List[str] = None,
+                 exec_timeframe: str = "M15",
+                 stake_amount: float = 10.0):
+        self.api          = api
+        self.risk_mgr     = risk_mgr
+        self.strategy     = StrategyEngine()
+        self.pairs        = selected_pairs or ALL_PAIRS
+        self.exec_tf      = exec_timeframe
+        self.stake        = stake_amount
+        self._running     = False
+        self._task        = None
+        self._last_signals: Dict[str, TradeSignal] = {}
+        self._open_ids:     Dict[str, int]  = {}  # symbol → db row id
+        self._contract_ids: Dict[str, int]  = {}  # symbol → deriv contract id
 
-        self.api: Optional[DerivAPI] = None
-        self._running       = False
-        self._thread        = None
+        init_db()
 
-        # In-memory caches for Streamlit display
-        self.last_signals:  list = []
-        self.active_trades: dict = {}    # contract_id → trade dict
+    # ─── CONTROL ────────────────────────────────────────────────────────────
 
-    # ── Lifecycle ──────────────────────────────────────────
-
-    def start(self) -> bool:
-        """Connect to API and begin the scan/trade loop."""
+    def start(self) -> None:
+        """Launch the async event loop in a background thread."""
         if self._running:
-            return True
-
-        self.api = MockDerivAPI() if self.demo_mode else DerivAPI(self.api_token)
-        ok = self.api.connect()
-        if not ok:
-            logger.error("TradeExecutor: API connection failed")
-            return False
-
-        # Sync balance
-        balance = self.api.refresh_balance()
-        self.rm.update_balance(balance)
-        save_account_snapshot(balance, balance)
-
+            return
         self._running = True
-        self._thread  = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-        logger.info(f"TradeExecutor started — {'DEMO' if self.demo_mode else 'LIVE'} mode")
-        return True
+        self._task = asyncio.create_task(self._loop())
+        log_event("info", "🚀 TradeExecutor started")
 
     def stop(self) -> None:
-        """Stop the loop gracefully."""
+        """Signal the loop to stop after the current iteration."""
         self._running = False
-        if self._thread:
-            self._thread.join(timeout=5)
-        logger.info("TradeExecutor stopped")
+        log_event("info", "🛑 TradeExecutor stop requested")
 
-    def close_all(self) -> int:
-        """Emergency close-all: sell every open contract."""
-        closed = 0
-        for cid, trade in list(self.active_trades.items()):
-            result = self.api.sell_contract(cid)
-            if result:
-                pnl = result.get("pnl", 0.0)
-                close_trade(trade["db_id"], result.get("sold_for", 0),
-                            "Manual Close All", pnl)
-                self.rm.record_trade_pnl(pnl)
-                self.active_trades.pop(cid, None)
-                closed += 1
-        logger.trade(f"Close-all complete: {closed} contracts closed")
-        return closed
+    async def close_all_trades(self) -> None:
+        """Force-close all open positions on Deriv."""
+        for symbol, contract_id in list(self._contract_ids.items()):
+            await self._close_position(symbol, contract_id, reason="Manual close-all")
 
-    # ── Main Loop ──────────────────────────────────────────
+    # ─── MAIN LOOP ──────────────────────────────────────────────────────────
 
-    def _loop(self) -> None:
+    async def _loop(self) -> None:
+        """Core async trading loop – runs until stop() is called."""
         while self._running:
             try:
-                self._scan_and_trade()
-                self._monitor_open_trades()
-                self._sync_balance()
+                await self._scan_cycle()
             except Exception as e:
-                logger.error(f"Loop error: {e}")
-            time.sleep(SCAN_INTERVAL)
+                log_error("Loop cycle error", e)
+            await asyncio.sleep(self.SCAN_INTERVAL)
 
-    def _scan_and_trade(self) -> None:
-        """Run analysis on every selected pair and open trades if conditions are met."""
-        open_count = len(self.active_trades)
-        signals    = []
+        log_event("info", "✅ TradeExecutor loop exited cleanly")
 
+    async def _scan_cycle(self) -> None:
+        """One full market scan cycle."""
+        # Update balance
+        bal_info = await self.api.get_balance()
+        balance = float(bal_info.get("balance", 0))
+        if balance:
+            self.risk_mgr.update_balance(balance)
+            insert_account_snapshot(balance, balance)
+
+        # Monitor open positions first
+        await self._monitor_positions()
+
+        # Check trading is still allowed
+        allowed, reason = self.risk_mgr.can_trade()
+        if not allowed:
+            log_event("warning", f"⏸ Trading paused: {reason}")
+            return
+
+        # Analyse each selected pair
         for symbol in self.pairs:
             if not self._running:
                 break
-            try:
-                sig = self._analyse_symbol(symbol)
-                signals.append(sig)
+            await self._analyse_and_trade(symbol)
+            await asyncio.sleep(1)   # polite rate limiting
 
-                if sig["signal"] in ("BUY", "SELL"):
-                    save_signal({
-                        "timestamp":    sig["timestamp"],
-                        "symbol":       symbol,
-                        "timeframe":    self.exec_tf,
-                        "signal":       sig["signal"],
-                        "entry":        sig["entry"],
-                        "stop_loss":    sig["stop_loss"],
-                        "tp1":          sig["tp1"],
-                        "tp2":          sig["tp2"],
-                        "tp3":          sig["tp3"],
-                        "confidence":   sig["confidence"],
-                        "trend":        sig["trend"],
-                        "trade_reason": sig["trade_reason"],
-                        "rr_ratio":     sig["rr_ratio"],
-                    })
+    # ─── ANALYSIS & ENTRY ───────────────────────────────────────────────────
 
-                    allowed, reason = self.rm.can_open_trade(open_count)
-                    if allowed:
-                        self._execute_trade(sig)
-                        open_count += 1
-                    else:
-                        logger.warn(f"Trade skipped [{symbol}]: {reason}")
+    async def _analyse_and_trade(self, symbol: str) -> None:
+        """Fetch data, generate signal, and enter trade if criteria met."""
+        try:
+            # Higher timeframe for trend bias
+            htf_trend = await self._get_htf_trend(symbol)
 
-            except Exception as e:
-                logger.error(f"Analysis error [{symbol}]: {e}")
+            # Execution timeframe analysis
+            gran = self.api.granularity(self.exec_tf)
+            df   = await self.api.get_candles(symbol, gran)
+            if df is None:
+                return
 
-        self.last_signals = signals
+            sig: TradeSignal = self.strategy.analyse(df, symbol, self.exec_tf, htf_trend)
+            self._last_signals[symbol] = sig
 
-    def _analyse_symbol(self, symbol: str) -> dict:
-        """Fetch candles for exec + HTF and run strategy analysis."""
-        df_exec = self.api.get_candles(symbol, self.exec_tf)
-        df_h1   = self.api.get_candles(symbol, "H1",  count=200)
-        df_h4   = self.api.get_candles(symbol, "H4",  count=100)
-        return analyse_market(symbol, self.exec_tf, df_exec, df_h1, df_h4)
+            # Persist signal
+            insert_signal(sig.to_dict())
+            log_signal(PAIR_DISPLAY.get(symbol, symbol),
+                       sig.signal, sig.confidence, sig.reason)
 
-    def _execute_trade(self, sig: dict) -> None:
-        """Place a contract based on a confirmed signal."""
-        symbol    = sig["symbol"]
-        direction = sig["signal"]
-        entry     = sig["entry"] or 0.0
-        sl        = sig["stop_loss"] or 0.0
-        stake     = self.rm.stake_amount(entry, sl, symbol)
+            # Trade entry conditions
+            if sig.signal in ("BUY", "SELL") and symbol not in self._contract_ids:
+                allowed, reason = self.risk_mgr.can_trade()
+                if allowed:
+                    await self._enter_trade(symbol, sig)
 
-        # Duration: 15 minutes for M15 exec timeframe
-        tf_secs   = TIMEFRAMES.get(self.exec_tf, 900)
-        duration  = max(1, tf_secs // 60)   # in minutes
+        except Exception as e:
+            log_error(f"analyse_and_trade({symbol})", e)
 
-        contract = self.api.buy_contract(
-            symbol        = symbol,
-            direction     = direction,
-            duration      = duration,
-            duration_unit = "m",
-            stake         = stake,
+    async def _enter_trade(self, symbol: str, sig: TradeSignal) -> None:
+        """Place a contract on Deriv and record it."""
+        sl_dist = abs(sig.entry - sig.sl) if sig.entry and sig.sl else 0.001
+        lot     = self.risk_mgr.position_size(sl_dist)
+
+        resp = await self.api.buy_contract(
+            symbol=symbol,
+            direction=sig.signal,
+            amount=self.stake,
+            duration=15,
+            duration_unit="m",
         )
 
-        if not contract:
-            logger.error(f"Trade execution failed for {symbol}")
+        if resp.get("error"):
+            log_error(f"Entry failed for {symbol}: {resp['error']['message']}")
             return
 
-        cid = str(contract.get("contract_id", ""))
-        trade_data = {
-            "contract_id":  cid,
-            "timestamp":    now_utc(),
-            "symbol":       symbol,
-            "direction":    direction,
-            "entry_price":  entry,
-            "stop_loss":    sl,
-            "tp1":          sig["tp1"],
-            "tp2":          sig["tp2"],
-            "tp3":          sig["tp3"],
-            "lot_size":     self.rm.lot_size,
-            "confidence":   sig["confidence"],
-            "trade_reason": sig["trade_reason"],
-        }
+        buy_info    = resp.get("buy", {})
+        contract_id = buy_info.get("contract_id")
+        entry_price = float(buy_info.get("start_price", sig.entry or 0))
 
-        db_id = save_trade(trade_data)
-        trade_data["db_id"] = db_id
-        self.active_trades[cid] = trade_data
+        if not contract_id:
+            log_error(f"No contract_id returned for {symbol}")
+            return
 
-        logger.trade(f"TRADE OPENED | {direction} {display_name(symbol)} "
-                     f"@ {entry:.5f} | SL {sl:.5f} | Stake ${stake:.2f} | "
-                     f"Conf {sig['confidence']:.0f}%")
-
-        logger.log_trade_csv({
-            "time":      now_utc(),
-            "event":     "OPEN",
-            "symbol":    display_name(symbol),
-            "direction": direction,
-            "entry":     entry,
-            "sl":        sl,
-            "tp1":       sig["tp1"],
-            "stake":     stake,
-            "confidence":sig["confidence"],
+        # Record
+        row_id = insert_trade({
+            "contract_id": str(contract_id),
+            "ts_open":     datetime.utcnow().isoformat(),
+            "symbol":      symbol,
+            "direction":   sig.signal,
+            "lot_size":    lot,
+            "entry":       entry_price,
+            "sl":          sig.sl,
+            "tp1":         sig.tp1,
+            "tp2":         sig.tp2,
+            "tp3":         sig.tp3,
+            "status":      "OPEN",
+            "confidence":  sig.confidence,
+            "reason":      sig.reason,
         })
 
-    # ── Trade Monitoring ───────────────────────────────────
+        self._open_ids[symbol]    = row_id
+        self._contract_ids[symbol] = contract_id
+        self.risk_mgr.record_trade_open()
 
-    def _monitor_open_trades(self) -> None:
-        """Check open contracts and close if TP / SL / reversal conditions met."""
-        for cid, trade in list(self.active_trades.items()):
+        log_trade_open(PAIR_DISPLAY.get(symbol, symbol),
+                       sig.signal, entry_price, sig.sl or 0, lot)
+
+    # ─── MONITORING & EXIT ──────────────────────────────────────────────────
+
+    async def _monitor_positions(self) -> None:
+        """Check every open contract for TP / SL / reversal exit."""
+        for symbol, contract_id in list(self._contract_ids.items()):
             try:
-                tick = self.api.get_tick(trade["symbol"])
-                if tick is None:
+                info = await self.api.get_contract_info(contract_id)
+                status = info.get("status", "open")
+
+                if status == "sold" or info.get("is_expired"):
+                    profit = float(info.get("profit", 0))
+                    exit_p = float(info.get("sell_price", info.get("entry_tick", 0)))
+                    await self._finalise_trade(symbol, contract_id, exit_p, profit)
                     continue
 
-                self._check_exit_conditions(cid, trade, tick)
+                # CHOCH / reversal exit
+                sig = self._last_signals.get(symbol)
+                if sig:
+                    new_sig = self._last_signals.get(symbol)
+                    if new_sig and new_sig.signal not in (sig.signal, "NO TRADE"):
+                        await self._close_position(symbol, contract_id,
+                                                    reason="Opposite signal / CHOCH")
             except Exception as e:
-                logger.error(f"Monitor error [{cid}]: {e}")
+                log_error(f"monitor_positions({symbol})", e)
 
-    def _check_exit_conditions(self, cid: str, trade: dict, current_price: float) -> None:
-        """Evaluate SL / TP / reversal exit rules."""
-        direction = trade["direction"]
-        entry     = trade["entry_price"]
-        sl        = trade["stop_loss"]
-        tp1       = trade["tp1"]
-        tp3       = trade["tp3"]
+    async def _close_position(self, symbol: str, contract_id: int,
+                               reason: str = "") -> None:
+        """Sell a contract at market."""
+        resp = await self.api.sell_contract(contract_id, price=0)
+        if resp.get("error"):
+            log_error(f"Close failed ({symbol}): {resp['error']['message']}")
+            return
+        sell_info  = resp.get("sell", {})
+        profit     = float(sell_info.get("profit", 0))
+        exit_price = float(sell_info.get("price", 0))
+        await self._finalise_trade(symbol, contract_id, exit_price, profit,
+                                    reason=reason)
 
-        exit_reason = None
+    async def _finalise_trade(self, symbol: str, contract_id: int,
+                               exit_price: float, profit: float,
+                               reason: str = "") -> None:
+        """Update DB, risk manager, and logs after a position closes."""
+        row_id = self._open_ids.pop(symbol, None)
+        self._contract_ids.pop(symbol, None)
 
-        if direction == "BUY":
-            if current_price <= sl:
-                exit_reason = "Stop Loss Hit"
-            elif tp3 and current_price >= tp3:
-                exit_reason = "TP3 Hit"
-            elif tp1 and current_price >= tp1:
-                exit_reason = "TP1 Hit"
-        else:  # SELL
-            if current_price >= sl:
-                exit_reason = "Stop Loss Hit"
-            elif tp3 and current_price <= tp3:
-                exit_reason = "TP3 Hit"
-            elif tp1 and current_price <= tp1:
-                exit_reason = "TP1 Hit"
+        if row_id:
+            close_trade(row_id, exit_price, profit)
 
-        if exit_reason:
-            self._close_trade(cid, trade, current_price, exit_reason)
+        self.risk_mgr.record_trade_close(profit)
+        upsert_daily_summary(
+            datetime.utcnow().strftime("%Y-%m-%d"),
+            win=profit >= 0,
+            pnl=profit
+        )
+        log_trade_close(PAIR_DISPLAY.get(symbol, symbol), exit_price, profit)
 
-    def _close_trade(self, cid: str, trade: dict,
-                     exit_price: float, reason: str) -> None:
-        """Execute close and persist results."""
-        result = self.api.sell_contract(cid)
-        pnl    = 0.0
-        if result:
-            pnl = float(result.get("pnl", 0.0))
-        else:
-            # Estimate PnL from price movement
-            if trade["direction"] == "BUY":
-                pnl = (exit_price - trade["entry_price"]) * trade["lot_size"] * 100_000
-            else:
-                pnl = (trade["entry_price"] - exit_price) * trade["lot_size"] * 100_000
-            pnl = round(pnl, 2)
+    # ─── HIGHER TIMEFRAME TREND ──────────────────────────────────────────────
 
-        close_trade(trade["db_id"], exit_price, reason, pnl)
-        self.rm.record_trade_pnl(pnl)
-        self.active_trades.pop(cid, None)
+    async def _get_htf_trend(self, symbol: str, tf: str = "H1") -> str:
+        """Quickly determine HTF trend for context."""
+        try:
+            gran = self.api.granularity(tf)
+            df   = await self.api.get_candles(symbol, gran, count=50)
+            if df is None:
+                return "ranging"
+            from indicators import add_emas, detect_market_structure
+            df = add_emas(df)
+            ms = detect_market_structure(df)
+            return ms["trend"]
+        except Exception:
+            return "ranging"
 
-        emoji = "🟢" if pnl > 0 else "🔴"
-        logger.trade(f"TRADE CLOSED | {reason} | "
-                     f"{display_name(trade['symbol'])} "
-                     f"@ {exit_price:.5f} | P&L {emoji} {pnl:+.2f}")
+    # ─── ACCESSORS ──────────────────────────────────────────────────────────
 
-        logger.log_trade_csv({
-            "time":      now_utc(),
-            "event":     "CLOSE",
-            "symbol":    display_name(trade["symbol"]),
-            "direction": trade["direction"],
-            "exit":      exit_price,
-            "pnl":       pnl,
-            "reason":    reason,
-        })
-
-    # ── Balance Sync ──────────────────────────────────────
-
-    def _sync_balance(self) -> None:
-        balance = self.api.refresh_balance()
-        self.rm.update_balance(balance)
-        save_account_snapshot(balance, balance)
-
-    # ── State for Dashboard ────────────────────────────────
+    @property
+    def last_signals(self) -> Dict[str, TradeSignal]:
+        return dict(self._last_signals)
 
     @property
     def is_running(self) -> bool:
         return self._running
-
-    def get_open_trades_list(self) -> list:
-        return list(self.active_trades.values())
-
-    def get_last_signals(self) -> list:
-        return self.last_signals
+      
