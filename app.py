@@ -1,681 +1,532 @@
 """
-app.py — Deriv AI Auto Trader — Main Streamlit Dashboard
-A production-ready multi-pair AI trading bot with ICT/SMC strategy.
+app.py - Deriv AI Automated Trader — Main Streamlit Dashboard
+Run: streamlit run app.py
 """
 
-import os
-import sys
-import time
+import asyncio
 import threading
+import time
+import os
+import pandas as pd
+import streamlit as st
+import plotly.graph_objects as go
 from datetime import datetime
 
-import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
-import plotly.express as px
-from plotly.subplots import make_subplots
-
-# ── Bootstrap paths ───────────────────────────────────────
-sys.path.insert(0, os.path.dirname(__file__))
-
-import database as db
-from config import (ALL_PAIRS, FOREX_PAIRS, CRYPTO_PAIRS, PAIR_DISPLAY,
-                    TIMEFRAMES, DEFAULT_RISK_PCT, DEFAULT_DAILY_LOSS,
-                    DEFAULT_MAX_TRADES, MIN_CONFIDENCE)
-from risk_manager import RiskManager
+# ── Project imports ────────────────────────────────────────────────────────
+from config import (
+    ALL_PAIRS, PAIR_DISPLAY, TIMEFRAMES, EXECUTION_TIMEFRAMES,
+    COLOR_GREEN, COLOR_RED, COLOR_BLACK, COLOR_CARD, COLOR_WHITE,
+    COLOR_MUTED, COLOR_BORDER, DERIV_API_TOKEN,
+    DEFAULT_RISK_PCT, DEFAULT_LOT_SIZE, DEFAULT_DAILY_LOSS, DEFAULT_MAX_TRADES
+)
+from database import (
+    init_db, get_signals, get_open_trades, get_closed_trades,
+    get_today_summary, get_account_history
+)
+from logger import get_logs, clear_logs
+from risk_manager import RiskManager, RiskSettings
+from deriv_api import DerivAPI
 from trade_executor import TradeExecutor
-from utils import display_name, colour_pnl
-import logger
+from utils import build_candle_chart, format_currency, color_pnl, signal_badge_html
 
-# ── Streamlit page config ─────────────────────────────────
+# ── Page Config ────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title  = "Deriv AI Auto Trader",
-    page_icon   = "⚡",
-    layout      = "wide",
-    initial_sidebar_state = "expanded",
+    page_title="Deriv AI Trader",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# ── Custom CSS ────────────────────────────────────────────
-st.markdown("""
+# ── Global CSS ─────────────────────────────────────────────────────────────
+st.markdown(f"""
 <style>
-/* ─── Google Fonts ─────────────────────── */
-@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap');
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=JetBrains+Mono&display=swap');
 
-html, body, [class*="css"] {
-    font-family: 'Syne', sans-serif;
-    background-color: #080c14;
-    color: #e2e8f0;
-}
+  html, body, [class*="css"] {{
+    font-family: 'Inter', sans-serif;
+    background-color: {COLOR_BLACK};
+    color: {COLOR_WHITE};
+  }}
 
-/* ─── Sidebar ──────────────────────────── */
-section[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #0d1117 0%, #0a0f1a 100%);
-    border-right: 1px solid #1e2d40;
-}
-section[data-testid="stSidebar"] * { font-family: 'Space Mono', monospace !important; }
+  /* Remove default streamlit padding */
+  .block-container {{ padding: 1rem 1.5rem 2rem 1.5rem !important; }}
+  header {{ background: transparent !important; }}
+  .stDeployButton {{ display: none; }}
 
-/* ─── Metric cards ─────────────────────── */
-[data-testid="stMetric"] {
-    background: linear-gradient(135deg, #0d1829 0%, #0a1220 100%);
-    border: 1px solid #1a2d42;
-    border-radius: 12px;
-    padding: 1rem 1.2rem;
-    box-shadow: 0 4px 24px rgba(0,200,255,0.04);
-    transition: border-color 0.3s;
-}
-[data-testid="stMetric"]:hover { border-color: #00c8ff44; }
-[data-testid="stMetricLabel"]  { color: #64a0bf !important; font-size: 0.72rem !important; text-transform: uppercase; letter-spacing: 0.1em; }
-[data-testid="stMetricValue"]  { color: #e2f4ff !important; font-family: 'Space Mono', monospace !important; }
-[data-testid="stMetricDelta"]  { font-family: 'Space Mono', monospace !important; }
-
-/* ─── Buttons ──────────────────────────── */
-.stButton > button {
-    font-family: 'Space Mono', monospace;
-    font-weight: 700;
-    letter-spacing: 0.06em;
+  /* ── Metric Cards ───────────────────────────── */
+  .metric-card {{
+    background: {COLOR_CARD};
+    border: 1px solid {COLOR_BORDER};
     border-radius: 8px;
+    padding: 14px 16px;
+    text-align: center;
+    min-height: 80px;
+  }}
+  .metric-label {{
+    font-size: 11px;
+    color: {COLOR_MUTED};
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 4px;
+  }}
+  .metric-value {{
+    font-size: 22px;
+    font-weight: 700;
+    line-height: 1.2;
+  }}
+  .metric-sub {{
+    font-size: 11px;
+    color: {COLOR_MUTED};
+    margin-top: 2px;
+  }}
+
+  /* ── Signal Cards ───────────────────────────── */
+  .signal-card {{
+    background: {COLOR_CARD};
+    border: 1px solid {COLOR_BORDER};
+    border-radius: 8px;
+    padding: 14px 16px;
+    margin-bottom: 8px;
+  }}
+  .signal-buy  {{ border-left: 4px solid {COLOR_GREEN}; }}
+  .signal-sell {{ border-left: 4px solid {COLOR_RED}; }}
+  .signal-none {{ border-left: 4px solid #555; }}
+
+  /* ── Log feed ───────────────────────────────── */
+  .log-container {{
+    background: #080808;
+    border: 1px solid {COLOR_BORDER};
+    border-radius: 6px;
+    padding: 10px;
+    max-height: 300px;
+    overflow-y: auto;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+  }}
+  .log-info    {{ color: {COLOR_WHITE}; }}
+  .log-warning {{ color: #FFA500; }}
+  .log-error   {{ color: {COLOR_RED}; }}
+
+  /* ── Tables ─────────────────────────────────── */
+  .stDataFrame {{ background: {COLOR_CARD}; border-radius: 8px; }}
+  thead tr th  {{ background: #1A1A1A !important; color: {COLOR_MUTED} !important;
+                  font-size: 11px !important; text-transform: uppercase; }}
+
+  /* ── Buttons ────────────────────────────────── */
+  .stButton > button {{
+    border-radius: 6px !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.04em !important;
     transition: all 0.2s;
-}
-.stButton > button:hover { transform: translateY(-1px); }
+  }}
+  .stButton > button:hover {{ opacity: 0.85; }}
 
-/* ─── Headings ─────────────────────────── */
-h1, h2, h3 { font-family: 'Syne', sans-serif; font-weight: 800; }
+  /* ── Sidebar ────────────────────────────────── */
+  section[data-testid="stSidebar"] {{
+    background: #0D0D0D;
+    border-right: 1px solid {COLOR_BORDER};
+  }}
+  .sidebar-title {{
+    font-size: 11px; color: {COLOR_MUTED}; text-transform: uppercase;
+    letter-spacing: 0.1em; margin: 12px 0 6px 0;
+    border-bottom: 1px solid {COLOR_BORDER}; padding-bottom: 4px;
+  }}
 
-/* ─── Signal cards ─────────────────────── */
-.signal-buy  { background:#0a1f12; border:1px solid #00c87744; border-radius:10px; padding:1rem; }
-.signal-sell { background:#1f0a0a; border:1px solid #ff444444; border-radius:10px; padding:1rem; }
-.signal-none { background:#0d1117; border:1px solid #2d3748;   border-radius:10px; padding:1rem; }
-
-/* ─── Log entry ────────────────────────── */
-.log-entry { font-family:'Space Mono',monospace; font-size:0.78rem; padding:0.25rem 0; border-bottom:1px solid #1a2332; }
-.log-TRADE  { color:#00e5a0; }
-.log-SIGNAL { color:#00bfff; }
-.log-WARN   { color:#ffbd2e; }
-.log-ERROR  { color:#ff5555; }
-.log-INFO   { color:#a0b8cc; }
-
-/* ─── Table tweaks ─────────────────────── */
-[data-testid="stDataFrame"] { border: 1px solid #1e2d40 !important; border-radius: 10px; }
-
-/* ─── Ticker header ────────────────────── */
-.ticker-header {
-    background: linear-gradient(90deg, #020b18 0%, #041224 50%, #020b18 100%);
-    border: 1px solid #0a2040;
-    border-radius: 14px;
-    padding: 1.2rem 1.8rem;
-    margin-bottom: 1.2rem;
-    display: flex;
-    align-items: center;
-    gap: 1rem;
-}
-
-/* ─── Tab bar ──────────────────────────── */
-button[data-baseweb="tab"] {
-    font-family: 'Space Mono', monospace !important;
-    font-size: 0.8rem !important;
-    letter-spacing: 0.05em;
-}
-
-/* ─── Score bar ────────────────────────── */
-.score-bar-wrap { margin: 0.15rem 0; }
-.score-bar-bg   { background:#0d1829; border-radius:4px; height:8px; }
-.score-bar-fill-buy  { background: linear-gradient(90deg,#00c877,#00bfff); height:8px; border-radius:4px; }
-.score-bar-fill-sell { background: linear-gradient(90deg,#ff5555,#ff9944); height:8px; border-radius:4px; }
+  /* ── Status badge ───────────────────────────── */
+  .status-running {{ color: {COLOR_GREEN}; font-weight: 700; }}
+  .status-stopped {{ color: {COLOR_RED};   font-weight: 700; }}
 </style>
 """, unsafe_allow_html=True)
 
-# ── State init ────────────────────────────────────────────
+
+# ── Session State Init ─────────────────────────────────────────────────────
 def _init_state():
     defaults = {
-        "executor":     None,
-        "bot_running":  False,
-        "demo_mode":    True,
-        "api_token":    "",
-        "last_refresh": 0,
+        "bot_running":   False,
+        "executor":      None,
+        "api":           None,
+        "risk_mgr":      None,
+        "loop_thread":   None,
+        "event_loop":    None,
+        "api_token":     DERIV_API_TOKEN,
+        "account_type":  "Demo",
+        "selected_pairs": list(PAIR_DISPLAY.keys())[:3],
+        "exec_tf":       "M15",
+        "lot_size":      DEFAULT_LOT_SIZE,
+        "risk_pct":      DEFAULT_RISK_PCT,
+        "daily_loss":    DEFAULT_DAILY_LOSS,
+        "max_trades":    DEFAULT_MAX_TRADES,
+        "stake_amount":  10.0,
+        "chart_symbol":  list(PAIR_DISPLAY.keys())[0],
+        "balance":       0.0,
+        "equity":        0.0,
+        "session_start": datetime.utcnow().strftime("%H:%M UTC"),
+        "demo_mode":     True,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
 _init_state()
-db.init_db()
+init_db()
 
-# ── Sidebar ────────────────────────────────────────────────
+
+# ── Async helpers ──────────────────────────────────────────────────────────
+
+def _run_async(coro):
+    """Run an async coroutine from a sync context."""
+    loop = st.session_state.get("event_loop")
+    if loop and loop.is_running():
+        fut = asyncio.run_coroutine_threadsafe(coro, loop)
+        return fut.result(timeout=30)
+    return asyncio.run(coro)
+
+
+def _start_background_loop(loop: asyncio.AbstractEventLoop):
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+
+# ── Bot Controls ───────────────────────────────────────────────────────────
+
+def start_bot():
+    """Connect to Deriv API and launch the trading executor."""
+    token = st.session_state.api_token
+    if not token:
+        st.error("⚠️ Enter your Deriv API token in the sidebar before starting.")
+        return
+
+    # Create dedicated event loop in background thread
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=_start_background_loop,
+                               args=(loop,), daemon=True)
+    thread.start()
+    st.session_state.event_loop  = loop
+    st.session_state.loop_thread = thread
+
+    api = DerivAPI(token=token)
+    connected = asyncio.run_coroutine_threadsafe(api.connect(), loop).result(timeout=20)
+
+    if not connected:
+        st.error("❌ Could not connect to Deriv. Check your token.")
+        loop.call_soon_threadsafe(loop.stop)
+        return
+
+    # Fetch initial balance
+    bal_info = asyncio.run_coroutine_threadsafe(api.get_balance(), loop).result(timeout=10)
+    balance  = float(bal_info.get("balance", 0))
+    st.session_state.balance = balance
+    st.session_state.equity  = balance
+
+    # Risk manager
+    settings = RiskSettings(
+        risk_pct=st.session_state.risk_pct,
+        daily_loss_pct=st.session_state.daily_loss,
+        max_open=st.session_state.max_trades,
+        lot_size=st.session_state.lot_size,
+    )
+    risk_mgr = RiskManager(settings)
+    risk_mgr.init_session(balance)
+
+    # Executor
+    executor = TradeExecutor(
+        api=api,
+        risk_mgr=risk_mgr,
+        selected_pairs=st.session_state.selected_pairs,
+        exec_timeframe=st.session_state.exec_tf,
+        stake_amount=st.session_state.stake_amount,
+    )
+    asyncio.run_coroutine_threadsafe(
+        _executor_task(executor), loop
+    )
+
+    st.session_state.api       = api
+    st.session_state.risk_mgr  = risk_mgr
+    st.session_state.executor  = executor
+    st.session_state.bot_running = True
+
+
+async def _executor_task(executor: TradeExecutor):
+    """Async wrapper so the executor loop runs inside the background event loop."""
+    executor._running = True
+    await executor._loop()
+
+
+def stop_bot():
+    executor: TradeExecutor = st.session_state.executor
+    if executor:
+        executor.stop()
+    loop = st.session_state.event_loop
+    if loop:
+        asyncio.run_coroutine_threadsafe(
+            st.session_state.api.disconnect(), loop
+        )
+    st.session_state.bot_running = False
+
+
+def close_all_trades():
+    executor: TradeExecutor = st.session_state.executor
+    loop = st.session_state.event_loop
+    if executor and loop:
+        asyncio.run_coroutine_threadsafe(executor.close_all_trades(), loop)
+
+
+def reset_session():
+    stop_bot()
+    clear_logs()
+    st.session_state.balance    = 0.0
+    st.session_state.equity     = 0.0
+    st.session_state.bot_running = False
+    st.session_state.executor   = None
+    st.session_state.api        = None
+    st.session_state.risk_mgr   = None
+
+
+# ── Helper renders ─────────────────────────────────────────────────────────
+
+def metric_card(label: str, value: str, sub: str = "", color: str = COLOR_WHITE) -> str:
+    return f"""
+    <div class="metric-card">
+      <div class="metric-label">{label}</div>
+      <div class="metric-value" style="color:{color};">{value}</div>
+      {f'<div class="metric-sub">{sub}</div>' if sub else ''}
+    </div>"""
+
+
+def render_signal_card(sig) -> str:
+    cls = {"BUY": "signal-buy", "SELL": "signal-sell"}.get(sig.signal, "signal-none")
+    color = COLOR_GREEN if sig.signal == "BUY" else (COLOR_RED if sig.signal == "SELL" else COLOR_MUTED)
+    conf_color = COLOR_GREEN if sig.confidence >= 85 else ("#FFA500" if sig.confidence >= 75 else COLOR_MUTED)
+    return f"""
+    <div class="signal-card {cls}">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+        <span style="font-weight:700;font-size:14px;">{PAIR_DISPLAY.get(sig.symbol, sig.symbol)}</span>
+        <span style="background:{color};color:#000;padding:2px 10px;border-radius:4px;
+                     font-weight:700;font-size:12px;">{sig.signal}</span>
+      </div>
+      <div style="display:flex;gap:16px;font-size:12px;color:{COLOR_MUTED};">
+        <span>TF: <b style="color:{COLOR_WHITE};">{sig.timeframe}</b></span>
+        <span>Conf: <b style="color:{conf_color};">{sig.confidence:.1f}%</b></span>
+        <span>RR: <b style="color:{COLOR_WHITE};">1:{sig.rr}</b></span>
+        <span>Trend: <b style="color:{COLOR_WHITE};">{sig.trend.title()}</b></span>
+      </div>
+      {f'<div style="font-size:11px;color:{COLOR_MUTED};margin-top:6px;">Entry: {sig.entry:.5f} | SL: {sig.sl:.5f} | TP1: {sig.tp1:.5f}</div>' if sig.entry else ''}
+    </div>"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ══════════════════════════════════════════════════════════════════════════════
 
 with st.sidebar:
     st.markdown("""
-    <div style='text-align:center;padding:1rem 0 0.5rem'>
-      <span style='font-size:2.2rem'>⚡</span><br>
-      <span style='font-family:Syne,sans-serif;font-size:1.3rem;font-weight:800;
-                   background:linear-gradient(90deg,#00c8ff,#00ff99);
-                   -webkit-background-clip:text;-webkit-text-fill-color:transparent'>
-        Deriv AI Trader
-      </span><br>
-      <span style='font-size:0.65rem;color:#4a7090;letter-spacing:0.15em'>
-        ICT · SMC · PRICE ACTION
-      </span>
-    </div>
-    """, unsafe_allow_html=True)
-    st.divider()
-
-    # ── Connection
-    st.markdown("**🔑 API CONNECTION**")
-    demo_mode = st.toggle("Demo Mode (no real funds)", value=True)
-    st.session_state["demo_mode"] = demo_mode
-
-    api_token = ""
-    if not demo_mode:
-        api_token = st.text_input("Deriv API Token", type="password",
-                                  placeholder="Enter your token...")
-    st.session_state["api_token"] = api_token
-
-    account_type = st.selectbox("Account Type", ["Real", "Demo"])
-    st.divider()
-
-    # ── Risk
-    st.markdown("**⚖️ RISK MANAGEMENT**")
-    risk_pct     = st.slider("Risk Per Trade (%)", 0.1, 5.0, DEFAULT_RISK_PCT, 0.1)
-    daily_loss   = st.slider("Daily Loss Limit (%)", 1.0, 20.0, DEFAULT_DAILY_LOSS, 0.5)
-    daily_profit = st.slider("Daily Profit Target (%)", 1.0, 30.0, 10.0, 0.5)
-    max_trades   = st.number_input("Max Open Trades", 1, 20, DEFAULT_MAX_TRADES)
-    lot_size     = st.number_input("Default Lot Size", 0.01, 10.0, 0.01, 0.01)
-    st.divider()
-
-    # ── Pairs
-    st.markdown("**📊 MARKETS**")
-    forex_sel  = st.multiselect("Forex Pairs",
-        options=FOREX_PAIRS,
-        default=["frxAUDUSD", "frxNZDUSD"],
-        format_func=display_name)
-    crypto_sel = st.multiselect("Crypto Pairs",
-        options=CRYPTO_PAIRS,
-        default=[],
-        format_func=display_name)
-    selected_pairs = forex_sel + crypto_sel
-
-    exec_tf = st.selectbox("Execution Timeframe",
-                            ["M5", "M15", "M30", "H1"], index=1)
-    st.divider()
-
-    # ── Bot Controls
-    st.markdown("**🤖 BOT CONTROLS**")
-    col_a, col_b = st.columns(2)
-
-    with col_a:
-        start_clicked = st.button("▶ START", use_container_width=True,
-                                  type="primary",
-                                  disabled=st.session_state["bot_running"])
-    with col_b:
-        stop_clicked  = st.button("⏹ STOP",  use_container_width=True,
-                                  disabled=not st.session_state["bot_running"])
-
-    close_all_btn = st.button("🚨 CLOSE ALL TRADES", use_container_width=True)
-    reset_btn     = st.button("🔄 RESET SESSION",    use_container_width=True)
-
-    # Bot status indicator
-    status_colour = "#00e5a0" if st.session_state["bot_running"] else "#ff5555"
-    status_label  = "RUNNING" if st.session_state["bot_running"] else "STOPPED"
-    st.markdown(f"""
-    <div style='text-align:center;margin-top:0.8rem;padding:0.5rem;
-                border:1px solid {status_colour}44;border-radius:8px;
-                background:{status_colour}11'>
-      <span style='color:{status_colour};font-family:Space Mono,monospace;
-                   font-size:0.75rem;font-weight:700;letter-spacing:0.15em'>
-        ● {status_label}
-      </span>
+    <div style='text-align:center;padding:12px 0 4px 0;'>
+      <div style='font-size:22px;font-weight:800;letter-spacing:0.02em;'>
+        <span style='color:#00FF88;'>DERIV</span>
+        <span style='color:#fff;'> AI</span>
+      </div>
+      <div style='font-size:11px;color:#888;letter-spacing:0.15em;margin-top:2px;'>
+        AUTOMATED TRADER
+      </div>
     </div>
     """, unsafe_allow_html=True)
 
     st.divider()
-    st.markdown("<span style='font-size:0.65rem;color:#2a3d52'>"
-                "v1.0 | For educational purposes only</span>",
-                unsafe_allow_html=True)
 
-
-# ── Button handlers ────────────────────────────────────────
-
-def _build_executor() -> TradeExecutor:
-    rm = RiskManager(
-        balance         = 10_000.0,
-        risk_pct        = risk_pct,
-        daily_loss_pct  = daily_loss,
-        daily_profit_pct= daily_profit,
-        max_trades      = int(max_trades),
-        lot_size        = lot_size,
+    # ── API Config ─────────────────────────────────────────────────────────
+    st.markdown('<div class="sidebar-title">🔑 API Configuration</div>', unsafe_allow_html=True)
+    st.session_state.api_token = st.text_input(
+        "Deriv API Token", value=st.session_state.api_token,
+        type="password", help="Get from app.deriv.com → API Token"
     )
-    return TradeExecutor(
-        api_token       = st.session_state["api_token"],
-        demo_mode       = st.session_state["demo_mode"],
-        risk_manager    = rm,
-        selected_pairs  = selected_pairs if selected_pairs else ["frxAUDUSD"],
-        exec_timeframe  = exec_tf,
+    st.session_state.account_type = st.selectbox(
+        "Account Type", ["Demo", "Real"],
+        index=0 if st.session_state.account_type == "Demo" else 1
     )
 
+    # ── Trade Settings ─────────────────────────────────────────────────────
+    st.markdown('<div class="sidebar-title">⚙️ Trade Settings</div>', unsafe_allow_html=True)
 
-if start_clicked:
-    if not selected_pairs:
-        st.sidebar.error("Select at least one pair")
-    else:
-        exc = _build_executor()
-        ok  = exc.start()
-        if ok:
-            st.session_state["executor"]    = exc
-            st.session_state["bot_running"] = True
-            logger.info("Bot started from dashboard")
+    st.session_state.stake_amount = st.number_input(
+        "Stake Per Trade ($)", min_value=1.0, max_value=10000.0,
+        value=st.session_state.stake_amount, step=1.0
+    )
+    st.session_state.lot_size = st.number_input(
+        "Lot Size (0 = auto)", min_value=0.0, max_value=100.0,
+        value=st.session_state.lot_size, step=0.01
+    )
+    st.session_state.risk_pct = st.slider(
+        "Risk Per Trade (%)", min_value=0.1, max_value=10.0,
+        value=st.session_state.risk_pct, step=0.1
+    )
+    st.session_state.daily_loss = st.slider(
+        "Daily Loss Limit (%)", min_value=1.0, max_value=20.0,
+        value=st.session_state.daily_loss, step=0.5
+    )
+    st.session_state.max_trades = st.number_input(
+        "Max Open Trades", min_value=1, max_value=20,
+        value=st.session_state.max_trades, step=1
+    )
+
+    # ── Market Selection ───────────────────────────────────────────────────
+    st.markdown('<div class="sidebar-title">📊 Market Selection</div>', unsafe_allow_html=True)
+    pair_options = list(PAIR_DISPLAY.keys())
+    pair_labels  = [PAIR_DISPLAY[p] for p in pair_options]
+    selected_labels = st.multiselect(
+        "Select Pairs",
+        options=pair_labels,
+        default=[PAIR_DISPLAY[p] for p in st.session_state.selected_pairs]
+    )
+    st.session_state.selected_pairs = [
+        k for k, v in PAIR_DISPLAY.items() if v in selected_labels
+    ]
+
+    # ── Timeframe ──────────────────────────────────────────────────────────
+    st.session_state.exec_tf = st.selectbox(
+        "Execution Timeframe", EXECUTION_TIMEFRAMES,
+        index=EXECUTION_TIMEFRAMES.index(st.session_state.exec_tf)
+    )
+
+    st.divider()
+
+    # ── Control Buttons ────────────────────────────────────────────────────
+    col1, col2 = st.columns(2)
+    with col1:
+        if not st.session_state.bot_running:
+            if st.button("▶ START", use_container_width=True, type="primary"):
+                start_bot()
+                st.rerun()
         else:
-            st.sidebar.error("Connection failed — check token or enable Demo mode")
+            if st.button("⏹ STOP", use_container_width=True):
+                stop_bot()
+                st.rerun()
+    with col2:
+        if st.button("✖ CLOSE ALL", use_container_width=True):
+            close_all_trades()
 
-if stop_clicked:
-    exc = st.session_state.get("executor")
-    if exc:
-        exc.stop()
-    st.session_state["bot_running"] = False
+    if st.button("↺ RESET SESSION", use_container_width=True):
+        reset_session()
+        st.rerun()
 
-if close_all_btn:
-    exc = st.session_state.get("executor")
-    if exc:
-        n = exc.close_all()
-        st.sidebar.success(f"Closed {n} trade(s)")
-    else:
-        st.sidebar.warning("Bot not running")
-
-if reset_btn:
-    exc = st.session_state.get("executor")
-    if exc and exc.is_running:
-        exc.rm.reset_session()
-    logger.clear_logs()
-    st.sidebar.success("Session reset")
+    # ── Status ─────────────────────────────────────────────────────────────
+    st.divider()
+    status_cls = "status-running" if st.session_state.bot_running else "status-stopped"
+    status_txt = "● RUNNING" if st.session_state.bot_running else "● STOPPED"
+    st.markdown(f'<div style="text-align:center;" class="{status_cls}">{status_txt}</div>',
+                unsafe_allow_html=True)
+    st.caption(f"Session started: {st.session_state.session_start}")
 
 
-# ── Helper: fetch live data ────────────────────────────────
-def _get_executor() -> TradeExecutor | None:
-    return st.session_state.get("executor")
-
-
-def _account_balance() -> float:
-    exc = _get_executor()
-    if exc and exc.api:
-        return exc.rm.balance
-    return 0.0
-
-
-def _daily_pnl() -> float:
-    exc = _get_executor()
-    if exc:
-        return exc.rm.daily_pnl
-    return 0.0
-
-
-# ══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN DASHBOARD
-# ══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
+# ── Header ─────────────────────────────────────────────────────────────────
 st.markdown("""
-<div class='ticker-header'>
-  <span style='font-size:1.8rem'>⚡</span>
-  <div>
-    <div style='font-family:Syne,sans-serif;font-size:1.5rem;font-weight:800;
-                background:linear-gradient(90deg,#00c8ff,#00ff99);
-                -webkit-background-clip:text;-webkit-text-fill-color:transparent'>
-      Deriv AI Auto Trader
-    </div>
-    <div style='font-size:0.7rem;color:#4a7090;letter-spacing:0.12em;font-family:Space Mono'>
-      ICT · SMART MONEY CONCEPTS · MULTI-TIMEFRAME ANALYSIS
-    </div>
+<div style='display:flex;align-items:center;gap:12px;margin-bottom:4px;'>
+  <div style='font-size:26px;font-weight:800;'>
+    <span style='color:#00FF88;'>DERIV</span>
+    <span style='color:#FFF;'> AI AUTOMATED TRADER</span>
   </div>
 </div>
 """, unsafe_allow_html=True)
 
-# ── Account KPIs ──────────────────────────────────────────
-today   = db.get_today_summary()
-balance = _account_balance()
-dpnl    = _daily_pnl()
-open_df = db.get_open_trades()
-closed_df = db.get_closed_trades(limit=200)
-win_rate  = today.get("win_rate", 0.0)
+# Fetch live data for display
+today   = get_today_summary()
+risk_mgr: RiskManager = st.session_state.risk_mgr
+balance  = risk_mgr.session.current_balance if risk_mgr else st.session_state.balance
+equity   = balance
+daily_pnl = risk_mgr.session.daily_pnl if risk_mgr else 0.0
+win_rate  = risk_mgr.win_rate if risk_mgr else 0.0
 
-k1, k2, k3, k4, k5, k6 = st.columns(6)
-k1.metric("💰 Balance",      f"${balance:,.2f}",
-          delta=f"{dpnl:+.2f}" if balance else None)
-k2.metric("📈 Daily P&L",    f"${dpnl:+.2f}",
-          delta_color="normal" if dpnl >= 0 else "inverse")
-k3.metric("🏆 Win Rate",     f"{win_rate:.1f}%")
-k4.metric("📂 Open Trades",  len(open_df))
-k5.metric("✅ Closed Today", today.get("trades_total", 0))
-k6.metric("🎯 Confidence Min", f"{MIN_CONFIDENCE}%")
+open_df   = get_open_trades()
+closed_df = get_closed_trades(50)
 
-st.divider()
+# ── KPI Row ────────────────────────────────────────────────────────────────
+k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
 
-# ── Tabs ──────────────────────────────────────────────────
-tab_chart, tab_signals, tab_open, tab_closed, tab_logs, tab_db = st.tabs([
-    "📊 Chart", "🔔 Signals", "📂 Open Trades",
-    "📋 Closed Trades", "📝 Live Log", "🗄️ Database"
-])
+metrics = [
+    (k1, "Balance",      f"${balance:,.2f}", "",                      COLOR_WHITE),
+    (k2, "Equity",       f"${equity:,.2f}",  "",                      COLOR_WHITE),
+    (k3, "Daily P&L",    format_currency(daily_pnl),
+                          f"{risk_mgr.daily_pnl_pct if risk_mgr else 0:+.2f}%",
+                          color_pnl(daily_pnl)),
+    (k4, "Win Rate",     f"{win_rate:.1f}%", f"{today.get('wins',0)}W / {today.get('losses',0)}L",
+                          COLOR_GREEN if win_rate >= 60 else COLOR_RED),
+    (k5, "Open Trades",  str(len(open_df)), f"Max {st.session_state.max_trades}", COLOR_WHITE),
+    (k6, "Closed Today", str(today.get('trades', 0)), "",              COLOR_WHITE),
+    (k7, "Status",
+          "RUNNING" if st.session_state.bot_running else "STOPPED",
+          "",
+          COLOR_GREEN if st.session_state.bot_running else COLOR_RED),
+]
 
+for col, label, value, sub, color in metrics:
+    col.markdown(metric_card(label, value, sub, color), unsafe_allow_html=True)
 
-# ══════ TAB 1 — CHART ════════════════════════════════════
-with tab_chart:
-    exc = _get_executor()
+st.markdown("<br>", unsafe_allow_html=True)
 
-    c1, c2 = st.columns([3, 1])
-    with c1:
-        chart_symbol = st.selectbox(
-            "Symbol", options=selected_pairs if selected_pairs else ["frxAUDUSD"],
-            format_func=display_name, key="chart_sym")
-    with c2:
-        chart_tf = st.selectbox("Timeframe",
-                                ["M5","M15","M30","H1","H4"], index=1, key="chart_tf")
+# ── Main Layout: Chart (left) + Signals (right) ────────────────────────────
+chart_col, sig_col = st.columns([2, 1])
 
-    # Fetch candles
-    candles_df = pd.DataFrame()
-    if exc and exc.api:
-        with st.spinner("Loading chart data…"):
-            candles_df = exc.api.get_candles(chart_symbol, chart_tf, count=150)
+with chart_col:
+    st.markdown(f'<div style="font-size:13px;font-weight:600;color:{COLOR_MUTED};'
+                f'letter-spacing:0.08em;text-transform:uppercase;margin-bottom:8px;">'
+                f'📈 Live Chart</div>', unsafe_allow_html=True)
 
-    if candles_df.empty:
-        # Generate demo data for display
-        from deriv_api import MockDerivAPI
-        mock = MockDerivAPI()
-        candles_df = mock.get_candles(chart_symbol, chart_tf, count=150)
+    # Chart symbol selector
+    chart_pairs   = [PAIR_DISPLAY[p] for p in st.session_state.selected_pairs] or list(PAIR_DISPLAY.values())[:1]
+    chart_display = st.selectbox("Symbol", chart_pairs, label_visibility="collapsed")
+    chart_symbol  = next((k for k, v in PAIR_DISPLAY.items() if v == chart_display),
+                          st.session_state.selected_pairs[0])
 
-    if not candles_df.empty:
-        # Add indicators for chart
-        from indicators import add_ema, add_rsi, add_atr
-        candles_df = add_ema(add_ema(candles_df.copy(), 50), 200)
-        candles_df = add_rsi(candles_df)
+    # Try to render a live chart; fallback to placeholder
+    chart_placeholder = st.empty()
 
-        fig = make_subplots(
-            rows=2, cols=1,
-            shared_xaxes=True,
-            row_heights=[0.75, 0.25],
-            vertical_spacing=0.02,
-        )
+    executor: TradeExecutor = st.session_state.executor
+    sig_for_chart = None
 
-        # Candlestick
-        # Candlestick Chart
-        fig.add_trace(
-          go.Candlestick(
-            x=candles_df["datetime"] if "datetime" in candles_df.columns else candles_df.index,
-            open=candles_df["open"],
-            high=candles_df["high"],
-            low=candles_df["low"],
-            close=candles_df["close"],
-            name="Price",
-            increasing=dict(
-              line=dict(color="#00e5a0")
-            ),
-            decreasing=dict(
-              line=dict(color="#ff5555")
-            )
-          ),
-          row=1,
-          col=1
-        )
-        # EMAs
-        if "ema_50" in candles_df.columns:
-          fig.add_trace(go.Scatter(
-                x=candles_df.get("datetime", candles_df.index),
-                y=candles_df["ema_50"], name="EMA 50",
-                line=dict(color="#00bfff", width=1.5, dash="dot"),
-            ), row=1, col=1)
-        if "ema_200" in candles_df.columns:
-            fig.add_trace(go.Scatter(
-                x=candles_df.get("datetime", candles_df.index),
-                y=candles_df["ema_200"], name="EMA 200",
-                line=dict(color="#ff9944", width=1.5),
-            ), row=1, col=1)
-
-        # Overlay signal markers
-        exc2 = _get_executor()
-        if exc2:
-            for sig in exc2.get_last_signals():
-                if sig.get("symbol") == chart_symbol and sig.get("entry"):
-                    col = "#00e5a0" if sig["signal"] == "BUY" else "#ff5555"
-                    fig.add_hline(y=sig["entry"],    line_color=col,    line_dash="dash", row=1, col=1)
-                    if sig.get("stop_loss"):
-                        fig.add_hline(y=sig["stop_loss"], line_color="#ffbd2e", line_dash="dot",  row=1, col=1)
-                    if sig.get("tp1"):
-                        fig.add_hline(y=sig["tp1"],       line_color="#00e5a0", line_dash="longdash", row=1, col=1)
-
-        # RSI
-        if "rsi" in candles_df.columns:
-            fig.add_trace(go.Scatter(
-                x=candles_df.get("datetime", candles_df.index),
-                y=candles_df["rsi"], name="RSI",
-                line=dict(color="#a78bfa", width=1.5),
-            ), row=2, col=1)
-            fig.add_hline(y=70, line_color="#ff5555", line_dash="dot", row=2, col=1)
-            fig.add_hline(y=30, line_color="#00e5a0", line_dash="dot", row=2, col=1)
-
-        fig.update_layout(
-            template="plotly_dark",
-            paper_bgcolor="#080c14",
-            plot_bgcolor="#080c14",
-            xaxis_rangeslider_visible=False,
-            height=520,
-            margin=dict(l=0, r=0, t=30, b=0),
-            legend=dict(font=dict(family="Space Mono", size=10)),
-            font=dict(family="Syne"),
-        )
-        fig.update_xaxes(gridcolor="#0d1829", showgrid=True)
-        fig.update_yaxes(gridcolor="#0d1829", showgrid=True)
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("Start the bot or select a pair to display chart data.")
-
-
-# ══════ TAB 2 — SIGNALS ══════════════════════════════════
-with tab_signals:
-    exc = _get_executor()
-    signals = exc.get_last_signals() if exc else []
-    sig_db  = db.get_signals(limit=50)
-
-    if signals:
-        st.markdown(f"#### Live Signals — {datetime.utcnow().strftime('%H:%M:%S')} UTC")
-        for sig in signals:
-            direction = sig.get("signal", "NO TRADE")
-            conf      = sig.get("confidence", 0)
-            sym       = display_name(sig.get("symbol", ""))
-
-            css_class = ("signal-buy"  if direction == "BUY" else
-                         "signal-sell" if direction == "SELL" else "signal-none")
-
-            dir_emoji = "🟢 BUY" if direction == "BUY" else ("🔴 SELL" if direction == "SELL" else "⚪ NO TRADE")
-
-            with st.expander(f"{sym}  |  {dir_emoji}  |  Confidence: {conf:.0f}%", expanded=(direction != "NO TRADE")):
-                st.markdown(f"<div class='{css_class}'>", unsafe_allow_html=True)
-
-                if direction != "NO TRADE":
-                    col1, col2, col3 = st.columns(3)
-                    col1.metric("Entry",       f"{sig.get('entry',0):.5f}")
-                    col2.metric("Stop Loss",   f"{sig.get('stop_loss',0):.5f}")
-                    col3.metric("R:R",         f"1:{sig.get('rr_ratio',0):.1f}")
-
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("TP1", f"{sig.get('tp1',0):.5f}")
-                    c2.metric("TP2", f"{sig.get('tp2',0):.5f}")
-                    c3.metric("TP3", f"{sig.get('tp3',0):.5f}")
-
-                    # Score breakdown
-                    scores = sig.get("scores", {})
-                    if scores:
-                        st.markdown("**AI Score Breakdown**")
-                        labels = {
-                            "market_structure": "Market Structure",
-                            "smc_confirmation": "SMC Confirmation",
-                            "rsi_confirmation": "RSI",
-                            "ema_trend":        "EMA Trend",
-                            "liquidity_sweep":  "Liquidity Sweep",
-                            "price_action":     "Price Action",
+    if executor:
+        sig_for_chart = executor.last_signals.get(chart_symbol)
+        loop = st.session_state.event_loop
+        if loop:
+            try:
+                gran = DerivAPI.granularity(st.session_state.exec_tf)
+                df_chart = asyncio.run_coroutine_threadsafe(
+                    st.session_state.api.get_candles(chart_symbol, gran, 100), loop
+                ).result(timeout=15)
+                if df_chart is not None:
+                    from indicators import add_emas, add_rsi
+                    df_chart = add_emas(add_rsi(df_chart))
+                    signals_dict = None
+                    if sig_for_chart and sig_for_chart.signal != "NO TRADE":
+                        signals_dict = {
+                            "entry": sig_for_chart.entry,
+                            "sl":    sig_for_chart.sl,
+                            "tp1":   sig_for_chart.tp1,
                         }
-                        from config import WEIGHTS
-                        for key, label in labels.items():
-                            raw   = scores.get(key, 0)
-                            wt    = WEIGHTS.get(key, 0)
-                            pct   = int(raw * 100)
-                            bar_w = int(raw * 200)
-                            fill_cls = "score-bar-fill-buy" if direction == "BUY" else "score-bar-fill-sell"
-                            st.markdown(
-                                f"<div class='score-bar-wrap'>"
-                                f"<span style='font-size:0.72rem;color:#64a0bf;font-family:Space Mono'>"
-                                f"{label} ({int(wt*100)}%)</span> — {pct}%<br>"
-                                f"<div class='score-bar-bg'>"
-                                f"<div class='{fill_cls}' style='width:{bar_w}px'></div>"
-                                f"</div></div>",
-                                unsafe_allow_html=True
-                            )
-
-                    st.markdown(f"**HTF Trend:** {sig.get('htf_trend','?')}")
-                    if sig.get("htf_warning"):
-                        st.warning(sig["htf_warning"])
-
-                    # Support / Resistance
-                    sup = sig.get("support", [])
-                    res = sig.get("resistance", [])
-                    if sup or res:
-                        sc, rc = st.columns(2)
-                        sc.markdown("**Support**\n" + "\n".join(f"• {v:.5f}" for v in sup))
-                        rc.markdown("**Resistance**\n" + "\n".join(f"• {v:.5f}" for v in res))
-
-                st.markdown(f"**Trend:** {sig.get('trend','?')}")
-                st.markdown(f"**Reason:** {sig.get('trade_reason','')}")
-                st.markdown(f"**Risk Warning:** _{sig.get('risk_warning','')}_")
-                st.markdown("</div>", unsafe_allow_html=True)
+                    fig = build_candle_chart(df_chart, chart_display, signals_dict)
+                    chart_placeholder.plotly_chart(fig, use_container_width=True,
+                                                    config={"displayModeBar": False})
+                else:
+                    chart_placeholder.info("Waiting for candle data…")
+            except Exception as e:
+                chart_placeholder.warning(f"Chart unavailable: {e}")
+        else:
+            chart_placeholder.info("Start the bot to load live charts.")
     else:
-        st.info("No live signals yet — start the bot to begin scanning.")
-
-    if not sig_db.empty:
-        st.markdown("---")
-        st.markdown("#### Signal History (database)")
-        display_cols = ["timestamp","symbol","timeframe","signal","confidence",
-                        "entry","stop_loss","tp1","rr_ratio","trend"]
-        display_cols = [c for c in display_cols if c in sig_db.columns]
-        st.dataframe(sig_db[display_cols].head(30), use_container_width=True)
-
-
-# ══════ TAB 3 — OPEN TRADES ══════════════════════════════
-with tab_open:
-    open_db = db.get_open_trades()
-    if open_db.empty:
-        st.info("No open trades.")
-    else:
-        st.markdown(f"**{len(open_db)} open position(s)**")
-        show_cols = ["id","timestamp","symbol","direction","entry_price",
-                     "stop_loss","tp1","lot_size","confidence"]
-        show_cols = [c for c in show_cols if c in open_db.columns]
-        st.dataframe(open_db[show_cols], use_container_width=True, height=300)
-
-        # Expose individual close buttons
-        exc = _get_executor()
-        if exc:
-            st.markdown("**Manual Close**")
-            for _, row in open_db.iterrows():
-                cid = row.get("contract_id","")
-                sym = display_name(row.get("symbol",""))
-                if st.button(f"Close {sym} #{row['id']}", key=f"close_{row['id']}"):
-                    result = exc.api.sell_contract(cid)
-                    if result:
-                        st.success(f"Closed {sym}")
-                    else:
-                        st.error("Close failed")
-
-
-# ══════ TAB 4 — CLOSED TRADES ════════════════════════════
-with tab_closed:
-    closed_db = db.get_closed_trades(200)
-    if closed_db.empty:
-        st.info("No closed trades yet.")
-    else:
-        # Stats bar
-        total_trades = len(closed_db)
-        wins  = (closed_db["pnl"] > 0).sum() if "pnl" in closed_db.columns else 0
-        gross = closed_db["pnl"].sum()        if "pnl" in closed_db.columns else 0
-
-        mc1, mc2, mc3, mc4 = st.columns(4)
-        mc1.metric("Total Trades", total_trades)
-        mc2.metric("Wins",         wins)
-        mc3.metric("Losses",       total_trades - wins)
-        mc4.metric("Gross P&L",    f"${gross:+.2f}")
-
-        # P&L equity curve
-        if "pnl" in closed_db.columns and not closed_db["pnl"].isna().all():
-            pnl_series = closed_db["pnl"].iloc[::-1].cumsum().reset_index(drop=True)
-            fig2 = go.Figure(go.Scatter(
-                y=pnl_series,
-                mode="lines+markers",
-                line=dict(color="#00c8ff", width=2),
-                fill="tozeroy",
-                fillcolor="#00c8ff11",
-                name="Cumulative P&L",
-            ))
-            fig2.update_layout(
-                template="plotly_dark", paper_bgcolor="#080c14",
-                plot_bgcolor="#080c14", height=200,
-                margin=dict(l=0,r=0,t=20,b=0),
-                yaxis_title="P&L ($)",
-            )
-            st.plotly_chart(fig2, use_container_width=True)
-
-        show = ["id","timestamp","symbol","direction","entry_price","exit_price",
-                "pnl","exit_reason","confidence"]
-        show = [c for c in show if c in closed_db.columns]
-        st.dataframe(closed_db[show], use_container_width=True, height=350)
-
-
-# ══════ TAB 5 — LIVE LOG ═════════════════════════════════
-with tab_logs:
-    logs = logger.get_logs()
-    if not logs:
-        st.info("No log entries yet.")
-    else:
-        log_html = ""
-        for entry in logs[:200]:
-            lvl = entry.get("level","INFO")
-            log_html += (f"<div class='log-entry log-{lvl}'>"
-                         f"<span style='color:#2a6080'>[{entry['time']}]</span> "
-                         f"<strong>{lvl}</strong> — {entry['message']}</div>")
-
-        st.markdown(
-            f"<div style='height:480px;overflow-y:auto;background:#040810;"
-            f"border:1px solid #0d1829;border-radius:10px;padding:0.8rem'>"
-            f"{log_html}</div>",
-            unsafe_allow_html=True
+        # Static placeholder chart
+        fig_empty = go.Figure()
+        fig_empty.update_layout(
+            template="plotly_dark", paper_bgcolor=COLOR_CARD, plot_bgcolor=COLOR_BLACK,
+            height=480, annotations=[dict(text="Start the bot to load charts",
+                                          xref="paper", yref="paper", x=0.5, y=0.5,
+                                          showarrow=False, font=dict(color=COLOR_MUTED, size=16))]
         )
+        chart_placeholder.plotly_chart(fig_empty, use_container_width=True,
+                                         config={"displayModeBar": False})
 
-    if st.button("🗑 Clear Log"):
-        logger.clear_logs()
-        st.rerun()
-
-
-# ══════ TAB 6 — DATABASE ═════════════════════════════════
-with tab_db:
-    st.markdown("#### Raw Database View")
-
-    db_table = st.selectbox("Table", ["signals","trades","account_history","daily_summary"])
-    import sqlite3
-    from config import DB_PATH
-
-    if os.path.exists(DB_PATH):
-        conn = sqlite3.connect(DB_PATH)
-        try:
-            raw = pd.read_sql_query(f"SELECT * FROM {db_table} ORDER BY id DESC LIMIT 100", conn)
-            st.dataframe(raw, use_container_width=True)
-        except Exception as e:
-            st.error(f"Query error: {e}")
-        finally:
-            conn.close()
-    else:
-        st.info("Database not yet created — start the bot first.")
-
-    # Download buttons
-    if not closed_df.empty:
-        csv = closed_df.to_csv(index=False)
-        st.download_button("⬇ Download Trades CSV", csv,
-                           "trades.csv", "text/csv")
-
-
-# ── Auto-refresh ──────────────────────────────────────────
-if st.session_state["bot_running"]:
-    time.sleep(0.5)
-    st.rerun()
+with sig_col:
+    st.markdown(f'<div style="font-size:13px;font-weight:600;color:{COLOR_MUTED};'
+                f'letter-spacing:0.08em;text-transform:uppercase;margin-bottom:8px;">'
+                f'🎯 Current Signals
