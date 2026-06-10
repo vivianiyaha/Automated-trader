@@ -1,137 +1,135 @@
 """
-risk_manager.py — Position sizing, daily limits, and drawdown controls.
+risk_manager.py - Position sizing, daily limits, and risk controls.
 """
 
-from datetime import date
-from config import DEFAULT_RISK_PCT, DEFAULT_DAILY_LOSS, DEFAULT_MAX_TRADES, TP_RR_RATIOS
-from utils import calc_position_size, pip_value
-import logger
+from dataclasses import dataclass, field
+from datetime import datetime, date
+from typing import Dict
+from logger import log_risk_halt
+
+
+@dataclass
+class RiskSettings:
+    risk_pct:       float = 1.0    # % of balance per trade
+    daily_loss_pct: float = 5.0    # max daily drawdown %
+    max_open:       int   = 5      # max simultaneous positions
+    lot_size:       float = 0.01   # manual override (0 = auto)
+
+
+@dataclass
+class SessionStats:
+    date:           str   = field(default_factory=lambda: str(date.today()))
+    start_balance:  float = 0.0
+    current_balance:float = 0.0
+    daily_pnl:      float = 0.0
+    trades_today:   int   = 0
+    wins_today:     int   = 0
+    open_positions: int   = 0
+    halted:         bool  = False
+    halt_reason:    str   = ""
 
 
 class RiskManager:
     """
-    Manages per-trade risk, daily limits, and maximum positions.
-
-    All state is kept in memory; the database is queried to determine daily P&L.
+    Central risk manager.
+    All trading decisions pass through can_trade() before execution.
     """
 
-    def __init__(self,
-                 balance:        float = 10_000.0,
-                 risk_pct:       float = DEFAULT_RISK_PCT,
-                 daily_loss_pct: float = DEFAULT_DAILY_LOSS,
-                 daily_profit_pct: float = 10.0,
-                 max_trades:     int   = DEFAULT_MAX_TRADES,
-                 lot_size:       float = 0.01):
+    def __init__(self, settings: RiskSettings = None):
+        self.settings = settings or RiskSettings()
+        self.session  = SessionStats()
 
-        self.balance          = balance
-        self.risk_pct         = risk_pct          # % per trade
-        self.daily_loss_pct   = daily_loss_pct    # halt if reached
-        self.daily_profit_pct = daily_profit_pct  # optional profit lock
-        self.max_trades       = max_trades
-        self.lot_size         = lot_size
+    # ─── SESSION ────────────────────────────────────────────────────────────
 
-        # Daily tracking
-        self._session_start_balance = balance
-        self._daily_pnl             = 0.0
-        self._today                 = date.today()
-        self._halted                = False
-
-    # ── State updates ──────────────────────────────────────
+    def init_session(self, balance: float) -> None:
+        """Call once when the bot starts or balance is fetched."""
+        self.session = SessionStats(
+            date=str(date.today()),
+            start_balance=balance,
+            current_balance=balance,
+        )
 
     def update_balance(self, new_balance: float) -> None:
-        """Call after every trade close or account snapshot."""
-        self._daily_pnl  = new_balance - self._session_start_balance
-        self.balance     = new_balance
-        self._check_limits()
+        self.session.current_balance = new_balance
+        self.session.daily_pnl = new_balance - self.session.start_balance
+        self._check_halt()
 
-    def record_trade_pnl(self, pnl: float) -> None:
-        self._daily_pnl += pnl
-        self.balance    += pnl
-        self._check_limits()
+    def record_trade_open(self) -> None:
+        self.session.open_positions += 1
+        self.session.trades_today   += 1
 
-    def reset_session(self) -> None:
-        """Reset daily tracking at session start or manual reset."""
-        self._session_start_balance = self.balance
-        self._daily_pnl             = 0.0
-        self._today                 = date.today()
-        self._halted                = False
-        logger.info("RiskManager: session reset")
+    def record_trade_close(self, profit: float) -> None:
+        self.session.open_positions = max(0, self.session.open_positions - 1)
+        if profit >= 0:
+            self.session.wins_today += 1
+        self.update_balance(self.session.current_balance + profit)
 
-    # ── Gate checks ────────────────────────────────────────
+    def reset_session(self, balance: float) -> None:
+        self.init_session(balance)
 
-    def can_open_trade(self, open_trade_count: int) -> tuple[bool, str]:
+    # ─── GATE ────────────────────────────────────────────────────────────────
+
+    def can_trade(self) -> tuple[bool, str]:
         """
-        Returns (allowed, reason).
-        Called before every new trade attempt.
+        Returns (allowed: bool, reason: str).
+        Call before placing any new trade.
         """
-        if self._halted:
-            return False, "Trading halted — daily loss limit reached"
+        if self.session.halted:
+            return False, f"Trading halted: {self.session.halt_reason}"
 
-        if open_trade_count >= self.max_trades:
-            return False, f"Max open trades ({self.max_trades}) reached"
+        if self.session.open_positions >= self.settings.max_open:
+            return False, f"Max open positions ({self.settings.max_open}) reached"
 
-        daily_loss_limit = self.balance * (self.daily_loss_pct / 100)
-        if self._daily_pnl <= -daily_loss_limit:
-            self._halted = True
-            logger.warn("RiskManager: daily loss limit hit — trading halted")
-            return False, "Daily loss limit reached"
-
-        daily_profit_target = self._session_start_balance * (self.daily_profit_pct / 100)
-        if self._daily_pnl >= daily_profit_target:
-            logger.info("RiskManager: daily profit target reached")
-            return False, "Daily profit target reached — no new trades"
+        daily_loss_limit = self.settings.daily_loss_pct / 100 * self.session.start_balance
+        if self.session.daily_pnl <= -daily_loss_limit:
+            self._halt(f"Daily loss limit {self.settings.daily_loss_pct}% hit")
+            return False, self.session.halt_reason
 
         return True, "OK"
 
+    # ─── POSITION SIZING ────────────────────────────────────────────────────
+
+    def position_size(self, sl_distance: float, tick_value: float = 1.0) -> float:
+        """
+        Auto position size formula:
+            size = (balance × risk_pct) / (sl_distance × tick_value)
+        Falls back to manual lot size if sl_distance is 0 or manual lot set.
+        """
+        if self.settings.lot_size > 0:
+            return self.settings.lot_size
+
+        if sl_distance <= 0:
+            return 0.01
+
+        risk_amount = self.session.current_balance * (self.settings.risk_pct / 100)
+        size = risk_amount / (sl_distance * tick_value)
+        # Cap at reasonable limits
+        size = max(0.01, min(size, 10.0))
+        return round(size, 2)
+
+    # ─── STATS ──────────────────────────────────────────────────────────────
+
     @property
-    def is_halted(self) -> bool:
-        return self._halted
+    def win_rate(self) -> float:
+        if self.session.trades_today == 0:
+            return 0.0
+        return round(self.session.wins_today / self.session.trades_today * 100, 1)
 
     @property
-    def daily_pnl(self) -> float:
-        return self._daily_pnl
+    def daily_pnl_pct(self) -> float:
+        if self.session.start_balance == 0:
+            return 0.0
+        return round(self.session.daily_pnl / self.session.start_balance * 100, 2)
 
-    # ── Position sizing ────────────────────────────────────
+    # ─── INTERNAL ───────────────────────────────────────────────────────────
 
-    def position_size(self, entry: float, stop_loss: float, symbol: str) -> float:
-        """
-        Calculate position size using the risk-per-trade formula.
-        Falls back to the user-configured lot size if calculation returns < 0.01.
-        """
-        sl_distance = abs(entry - stop_loss)
-        pip_val     = pip_value(symbol, entry)
-        size        = calc_position_size(self.balance, self.risk_pct, sl_distance, pip_val)
-        if size < 0.01:
-            size = self.lot_size
-        logger.debug(f"Position size for {symbol}: {size} lots "
-                     f"(risk {self.risk_pct}% of {self.balance:.2f})")
-        return size
+    def _check_halt(self) -> None:
+        limit = self.settings.daily_loss_pct / 100 * self.session.start_balance
+        if self.session.daily_pnl <= -limit and not self.session.halted:
+            self._halt(f"Daily loss limit {self.settings.daily_loss_pct}% reached")
 
-    def stake_amount(self, entry: float, stop_loss: float, symbol: str) -> float:
-        """
-        Return a stake amount in account currency suitable for binary/digital contracts.
-        This is the $ amount at risk, floored to $1.
-        """
-        risk_amount = self.balance * (self.risk_pct / 100)
-        return max(1.0, round(risk_amount, 2))
-
-    # ── Internal ───────────────────────────────────────────
-
-    def _check_limits(self) -> None:
-        daily_loss_limit = self._session_start_balance * (self.daily_loss_pct / 100)
-        if self._daily_pnl <= -daily_loss_limit and not self._halted:
-            self._halted = True
-            logger.warn(f"RiskManager: daily loss {self._daily_pnl:.2f} — HALT")
-
-    # ── Summary ────────────────────────────────────────────
-
-    def summary(self) -> dict:
-        return {
-            "balance":            round(self.balance, 2),
-            "risk_pct":           self.risk_pct,
-            "daily_pnl":          round(self._daily_pnl, 2),
-            "daily_loss_limit":   round(self.balance * (self.daily_loss_pct / 100), 2),
-            "daily_profit_target":round(self._session_start_balance * (self.daily_profit_pct / 100), 2),
-            "max_trades":         self.max_trades,
-            "halted":             self._halted,
-        }
+    def _halt(self, reason: str) -> None:
+        self.session.halted     = True
+        self.session.halt_reason = reason
+        log_risk_halt(reason)
+        
