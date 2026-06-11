@@ -78,13 +78,19 @@ class DerivAPI:
         """Internal: (re-)establish the WebSocket connection."""
         try:
             url = f"{DERIV_WS_URL}?app_id={self.app_id}"
-            ws  = await websockets.connect(
-                url,
+            # Build connect kwargs — close_timeout was renamed in websockets >=14
+            connect_kwargs = dict(
                 ping_interval=None,   # We manage pings ourselves
                 ping_timeout=None,
-                close_timeout=5,
                 max_size=2**22,       # 4 MB frames
             )
+            import websockets as _ws_mod
+            _ws_ver = tuple(int(x) for x in _ws_mod.__version__.split(".")[:2])
+            if _ws_ver >= (14, 0):
+                connect_kwargs["open_timeout"] = 10
+            else:
+                connect_kwargs["close_timeout"] = 5
+            ws  = await websockets.connect(url, **connect_kwargs)
             self._ws = ws
             self._connected = False   # not ready until auth succeeds
 
@@ -426,8 +432,19 @@ class DerivAPI:
         return TIMEFRAMES.get(tf_label, 300)
 
     def is_alive(self) -> bool:
-        """Quick sync check — True if WS is open and we are authenticated."""
-        return (self._connected
-                and self._ws is not None
-                and not self._ws.closed)
-            
+        """Quick sync check — True if WS is open and we are authenticated.
+        Compatible with websockets >=14 (uses close_code) and older (uses .closed).
+        """
+        if not self._connected or self._ws is None:
+            return False
+        # websockets >=14 renamed .closed → tracks via close_code
+        try:
+            return self._ws.close_code is None
+        except AttributeError:
+            pass
+        # websockets <14
+        try:
+            return not self._ws.closed
+        except AttributeError:
+            return False
+          
