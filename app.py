@@ -528,4 +528,100 @@ with chart_col:
 with sig_col:
     st.markdown(f'<div style="font-size:13px;font-weight:600;color:{COLOR_MUTED};'
                 f'letter-spacing:0.08em;text-transform:uppercase;margin-bottom:8px;">'
-                f'🎯 Current Signals</div>', unsafe_allow_html=True
+                f'🎯 Current Signals</div>', unsafe_allow_html=True)
+
+    sig_area = st.container()
+    with sig_area:
+        if executor:
+            sigs = executor.last_signals
+            if sigs:
+                for sym, sig in sigs.items():
+                    if sig.signal != "NO TRADE":
+                        st.markdown(render_signal_card(sig), unsafe_allow_html=True)
+                if not any(s.signal != "NO TRADE" for s in sigs.values()):
+                    st.markdown(f'<div style="color:{COLOR_MUTED};padding:20px;text-align:center;">'
+                                f'No active signals.<br>Bot is scanning markets…</div>',
+                                unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div style="color:{COLOR_MUTED};padding:20px;text-align:center;">'
+                            f'Awaiting first scan…</div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div style="color:{COLOR_MUTED};padding:20px;text-align:center;">'
+                        f'Start the bot to see signals.</div>', unsafe_allow_html=True)
+
+st.divider()
+
+# ── Tables: Open & Closed Positions ────────────────────────────────────────
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["📂 Open Positions", "✅ Closed Trades", "📊 Signal History", "📜 Trade Log"]
+)
+
+with tab1:
+    if open_df.empty:
+        st.markdown(f'<div style="color:{COLOR_MUTED};padding:16px;text-align:center;">'
+                    f'No open positions.</div>', unsafe_allow_html=True)
+    else:
+        display_cols = ["id","symbol","direction","entry","sl","tp1","tp2","lot_size",
+                        "confidence","ts_open"]
+        show = open_df[[c for c in display_cols if c in open_df.columns]].copy()
+        show["symbol"] = show["symbol"].map(lambda s: PAIR_DISPLAY.get(s, s))
+        st.dataframe(show, use_container_width=True, hide_index=True)
+
+with tab2:
+    if closed_df.empty:
+        st.markdown(f'<div style="color:{COLOR_MUTED};padding:16px;text-align:center;">'
+                    f'No closed trades yet.</div>', unsafe_allow_html=True)
+    else:
+        show_c = closed_df.copy()
+        show_c["symbol"] = show_c["symbol"].map(lambda s: PAIR_DISPLAY.get(s, s))
+        show_c = show_c[["id","symbol","direction","entry","exit_price","profit",
+                           "confidence","ts_open","ts_close"]]
+        # Colour profit column
+        def style_profit(val):
+            try:
+                return f"color: {COLOR_GREEN}" if float(val) >= 0 else f"color: {COLOR_RED}"
+            except Exception:
+                return ""
+        styled = show_c.style.applymap(style_profit, subset=["profit"])
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+
+with tab3:
+    sig_df = get_signals(100)
+    if sig_df.empty:
+        st.markdown(f'<div style="color:{COLOR_MUTED};padding:16px;text-align:center;">'
+                    f'No signals generated yet.</div>', unsafe_allow_html=True)
+    else:
+        sig_df["symbol"] = sig_df["symbol"].map(lambda s: PAIR_DISPLAY.get(s, s))
+        cols = ["ts","symbol","timeframe","signal","entry","sl","tp1","confidence","trend"]
+        st.dataframe(sig_df[[c for c in cols if c in sig_df.columns]],
+                     use_container_width=True, hide_index=True)
+
+with tab4:
+    logs = get_logs(150)
+    if not logs:
+        st.markdown(f'<div style="color:{COLOR_MUTED};padding:16px;text-align:center;">'
+                    f'No log entries yet.</div>', unsafe_allow_html=True)
+    else:
+        log_html = '<div class="log-container">'
+        for entry in logs:
+            lvl = entry.get("level", "INFO").lower()
+            ts  = entry.get("ts", "")
+            msg = entry.get("message", "")
+            log_html += f'<div class="log-{lvl}"><span style="color:#555;">[{ts}]</span> {msg}</div>'
+        log_html += "</div>"
+        st.markdown(log_html, unsafe_allow_html=True)
+
+        if st.button("Clear Logs"):
+            clear_logs()
+            st.rerun()
+
+# ── Auto-refresh ───────────────────────────────────────────────────────────
+if st.session_state.bot_running:
+    st.markdown(
+        f'<div style="text-align:right;font-size:11px;color:{COLOR_MUTED};'
+        f'margin-top:8px;">Auto-refreshing every 30s | '
+        f'{datetime.utcnow().strftime("%H:%M:%S UTC")}</div>',
+        unsafe_allow_html=True
+    )
+    time.sleep(30)
+    st.rerun()
