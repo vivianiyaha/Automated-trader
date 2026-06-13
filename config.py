@@ -24,7 +24,7 @@ FOREX_PAIRS = [
 ]
 
 CRYPTO_PAIRS = [
-    "cryLTCUSD", "cryXRPUSD", "cryBCHUSD", "cryETHUSD
+    "cryLTCUSD", "cryXRPUSD", "cryBCHUSD", "cryETHUSD"
 ]
 
 ALL_PAIRS = FOREX_PAIRS + CRYPTO_PAIRS
