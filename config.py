@@ -1,3 +1,8 @@
+"""
+config.py - Central configuration for Deriv AI Automated Trader
+All API keys, constants, and default settings live here.
+"""
+
 import os
 from dotenv import load_dotenv
 
@@ -19,7 +24,7 @@ FOREX_PAIRS = [
 ]
 
 CRYPTO_PAIRS = [
-    "cryLTCUSD", "cryXRPUSD", "cryETHUSD", "cryBCHUSD"
+    "cryLTCUSD", "cryXRPUSD", "cryBCHUSD"
 ]
 
 ALL_PAIRS = FOREX_PAIRS + CRYPTO_PAIRS
@@ -28,7 +33,7 @@ PAIR_DISPLAY = {
     "frxNZDUSD": "NZD/USD", "frxAUDCHF": "AUD/CHF", "frxAUDUSD": "AUD/USD",
     "frxAUDNZD": "AUD/NZD", "frxAUDCAD": "AUD/CAD", "frxNZDCHF": "NZD/CHF",
     "frxNZDCAD": "NZD/CAD", "frxNZDJPY": "NZD/JPY", "frxCADCHF": "CAD/CHF",
-    "cryLTCUSD": "LTC/USD", "cryXRPUSD": "XRP/USD", "cryBCHUSD": "BCH/USD",  "ETHUSD"
+    "cryLTCUSD": "LTC/USD", "cryXRPUSD": "XRP/USD", "cryBCHUSD": "BCH/USD"
 }
 
 # ─────────────────────────────────────────────
