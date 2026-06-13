@@ -24,13 +24,13 @@ FOREX_PAIRS = [
 ]
 
 CRYPTO_PAIRS = [
-    "cryLTCUSD", "cryXRPUSD", "cryBCHUSD"
+    "cryLTCUSD", "cryXRPUSD", "cryETHUSD", "cryBCHUSD"
 ]
 
 ALL_PAIRS = FOREX_PAIRS + CRYPTO_PAIRS
 
 PAIR_DISPLAY = {
-    "frxNZDUSD": "NZD/USD", "frxAUDCHF": "AUD/CHF", "frxAUDUSD": "AUD/USD",
+    "frxNZDUSD": "NZD/USD", "frxAUDCHF": "AUD/CHF", "frxAUDUSD": "AUD/USD", "ETHUSD",
     "frxAUDNZD": "AUD/NZD", "frxAUDCAD": "AUD/CAD", "frxNZDCHF": "NZD/CHF",
     "frxNZDCAD": "NZD/CAD", "frxNZDJPY": "NZD/JPY", "frxCADCHF": "CAD/CHF",
     "cryLTCUSD": "LTC/USD", "cryXRPUSD": "XRP/USD", "cryBCHUSD": "BCH/USD"
