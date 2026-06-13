@@ -1,7 +1,5 @@
-"""
-config.py - Central configuration for Deriv AI Automated Trader
-All API keys, constants, and default settings live here.
-"""
+
+# config.py - Central configuration for Deriv AI Automated Trader. All API keys, constants, and default settings live here.
 
 import os
 from dotenv import load_dotenv
