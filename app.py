@@ -31,7 +31,7 @@ from utils import build_candle_chart, format_currency, color_pnl, signal_badge_h
 
 # ── Page Config ────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Deriv AI Trader",
+    page_title="AUTOMATED BOT TRADER",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
